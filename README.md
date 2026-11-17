@@ -59,6 +59,19 @@ CP="$HOME/Applications/Claude Profiles.app/Contents/MacOS/ClaudeProfiles"
 
 A launcher focuses the profile when it is already running instead of starting a second copy.
 
+## Dock setup
+
+Make a launcher for **every** profile, including the default one, and pin the launchers instead of `Claude.app`:
+
+```sh
+"$CP" --make-launcher default "/Applications/Claude Personal.app" /Applications/Claude.app/Contents/Resources/electron.icns
+"$CP" --make-launcher work    "/Applications/Claude Work.app"     ~/Pictures/work.icns
+```
+
+Then drag both into the Dock and remove the `Claude.app` pin.
+
+Why: all profiles are instances of the same `Claude.app`, so its Dock icon cannot tell them apart. With two profiles open, clicking it may do nothing or bring up the wrong one. A launcher targets its profile's exact process, so each Dock icon always opens its own window. While a profile is running, macOS also shows a regular Claude icon for it in the Dock. That is expected.
+
 ## Uninstall
 
 ```sh
