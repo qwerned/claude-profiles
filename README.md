@@ -10,7 +10,7 @@ Claude Profiles is a tiny menu bar helper that takes over the `claude://` scheme
 - **several running** → a chooser asks which profile started it;
 - **chosen profile closed** → it is opened first, then gets the link.
 
-The menu bar icon also lists your profiles, shows which are running and opens or focuses any of them.
+The menu bar icon also lists your profiles, shows which are running and opens or focuses any of them, and every profile gets a global shortcut (⌃⌥1, ⌃⌥2, …).
 
 ## Install
 
@@ -41,6 +41,19 @@ The script builds the helper from source, installs it to `~/Applications/Claude 
 - A profile without `userDataDir` is Claude's stock profile.
 - `icon` (optional) is a path to an `.app` or image used in the chooser.
 - `alwaysAsk: true` shows the chooser even when only one profile is open.
+- `hotkey` sets a global shortcut for the profile, for example `"ctrl+opt+1"` or `"ctrl+opt+w"`; `"none"` turns it off. Without it, the first nine profiles get **⌃⌥1 … ⌃⌥9** in list order: three keys under one hand, and macOS itself assigns nothing to ⌃⌥ with a digit. Modifiers: `ctrl`, `opt`, `cmd`, `shift`; keys: letters, digits, `f1`–`f12`, `space`.
+
+Changes to the file are picked up within a few seconds, no restart needed.
+
+## Shortcuts
+
+Press a profile's shortcut from anywhere:
+
+- profile closed → it starts;
+- open in the background → its window comes to the front;
+- already in front → it hides, so the same keys toggle it.
+
+The menu bar menu shows each profile's shortcut and a green dot next to the profiles that are running. If another app already owns a shortcut, the menu says so; pick a different one in `profiles.json`. No Accessibility permission is needed.
 
 To start a profile by hand: `open -n -a Claude --args --user-data-dir="$HOME/Library/Application Support/Claude-Work"`.
 
@@ -49,7 +62,7 @@ To start a profile by hand: `open -n -a Claude --args --user-data-dir="$HOME/Lib
 ```sh
 CP="$HOME/Applications/Claude Profiles.app/Contents/MacOS/ClaudeProfiles"
 "$CP" --status            # handler owner and which profiles are running
-"$CP" --preview           # show the chooser without sending anything
+"$CP" --preview           # show the link chooser without sending anything
 "$CP" --restore-handler   # give claude:// back to Claude Desktop
 "$CP" --open work         # focus the profile, or start it if closed
 

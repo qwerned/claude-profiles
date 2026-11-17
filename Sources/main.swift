@@ -8,6 +8,7 @@
 // asks which one should receive the link.
 
 import AppKit
+import Carbon.HIToolbox
 import CoreServices
 import Darwin
 
@@ -29,6 +30,9 @@ struct Profile: Codable, Equatable {
     var userDataDir: String?
     /// Optional .app or .icns whose icon is shown in the chooser.
     var icon: String?
+    /// Global shortcut such as "ctrl+opt+1"; "none" turns it off. Missing means the default
+    /// ⌃⌥<position> for the first nine profiles.
+    var hotkey: String?
 
     var dataDir: String? {
         guard let d = userDataDir, !d.isEmpty else { return nil }
@@ -318,6 +322,107 @@ func critterIcon() -> NSImage {
     return image
 }
 
+// MARK: - Bringing a profile forward
+
+/// Shows a running profile's window the way a Dock click would.
+func bringForward(_ app: NSRunningApplication) {
+    // 'aevt/rapp' is what a Dock click sends: a hidden or windowless Claude shows its window again.
+    let reopen = NSAppleEventDescriptor(eventClass: AEEventClass(kCoreEventClass), eventID: AEEventID(kAEReopenApplication),
+                                        targetDescriptor: NSAppleEventDescriptor(processIdentifier: app.processIdentifier),
+                                        returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+    _ = try? reopen.sendEvent(options: [.noReply], timeout: 5)
+    app.unhide()
+    if #available(macOS 14.0, *), let me = NSApp as NSApplication? { me.yieldActivation(to: app) }
+    app.activate(options: [.activateAllWindows])
+}
+
+// MARK: - Global shortcuts
+
+struct KeyCombo {
+    let keyCode: UInt32
+    let carbonModifiers: UInt32
+    let menuKey: String
+    let menuModifiers: NSEvent.ModifierFlags
+    let display: String
+
+    private static let keys: [String: Int] = {
+        var k: [String: Int] = [
+            "0": kVK_ANSI_0, "1": kVK_ANSI_1, "2": kVK_ANSI_2, "3": kVK_ANSI_3, "4": kVK_ANSI_4,
+            "5": kVK_ANSI_5, "6": kVK_ANSI_6, "7": kVK_ANSI_7, "8": kVK_ANSI_8, "9": kVK_ANSI_9,
+            "a": kVK_ANSI_A, "b": kVK_ANSI_B, "c": kVK_ANSI_C, "d": kVK_ANSI_D, "e": kVK_ANSI_E, "f": kVK_ANSI_F,
+            "g": kVK_ANSI_G, "h": kVK_ANSI_H, "i": kVK_ANSI_I, "j": kVK_ANSI_J, "k": kVK_ANSI_K, "l": kVK_ANSI_L,
+            "m": kVK_ANSI_M, "n": kVK_ANSI_N, "o": kVK_ANSI_O, "p": kVK_ANSI_P, "q": kVK_ANSI_Q, "r": kVK_ANSI_R,
+            "s": kVK_ANSI_S, "t": kVK_ANSI_T, "u": kVK_ANSI_U, "v": kVK_ANSI_V, "w": kVK_ANSI_W, "x": kVK_ANSI_X,
+            "y": kVK_ANSI_Y, "z": kVK_ANSI_Z, "space": kVK_Space,
+        ]
+        let fkeys = [kVK_F1, kVK_F2, kVK_F3, kVK_F4, kVK_F5, kVK_F6, kVK_F7, kVK_F8, kVK_F9, kVK_F10, kVK_F11, kVK_F12]
+        for (n, code) in fkeys.enumerated() { k["f\(n + 1)"] = code }
+        return k
+    }()
+
+    /// Parses "ctrl+opt+cmd+1", "⌃⌥⌘1"-style symbols are accepted as separate parts ("⌃+⌥+⌘+1").
+    init?(_ text: String) {
+        var carbon: UInt32 = 0, flags: NSEvent.ModifierFlags = [], symbols = "", key: String?
+        for raw in text.lowercased().split(separator: "+").map({ $0.trimmingCharacters(in: .whitespaces) }) {
+            switch raw {
+            case "ctrl", "control", "⌃": carbon |= UInt32(controlKey); flags.insert(.control)
+            case "opt", "option", "alt", "⌥": carbon |= UInt32(optionKey); flags.insert(.option)
+            case "cmd", "command", "⌘": carbon |= UInt32(cmdKey); flags.insert(.command)
+            case "shift", "⇧": carbon |= UInt32(shiftKey); flags.insert(.shift)
+            default: if key != nil { return nil }; key = raw
+            }
+        }
+        guard let key, let code = KeyCombo.keys[key] else { return nil }
+        let isFunctionKey = key.hasPrefix("f") && key.count > 1
+        guard carbon != 0 || isFunctionKey else { return nil }  // a bare letter would hijack typing
+        if flags.contains(.control) { symbols += "⌃" }
+        if flags.contains(.option) { symbols += "⌥" }
+        if flags.contains(.shift) { symbols += "⇧" }
+        if flags.contains(.command) { symbols += "⌘" }
+        keyCode = UInt32(code); carbonModifiers = carbon; menuModifiers = flags
+        menuKey = isFunctionKey ? "" : (key == "space" ? " " : key)
+        display = symbols + (key == "space" ? "Space" : key.uppercased())
+    }
+
+    /// The shortcut a profile uses, nil when disabled or unparseable.
+    static func `for`(_ p: Profile, position: Int) -> KeyCombo? {
+        if let h = p.hotkey { return h.lowercased() == "none" ? nil : KeyCombo(h) }
+        return position < 9 ? KeyCombo("ctrl+opt+\(position + 1)") : nil
+    }
+}
+
+/// Carbon hot keys: system-wide, and unlike an event tap they need no Accessibility permission.
+final class HotKeys {
+    static let shared = HotKeys()
+    private var refs: [EventHotKeyRef] = []
+    private var actions: [UInt32: () -> Void] = [:]
+    private var installed = false
+
+    private func installHandler() {
+        guard !installed else { return }; installed = true
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+            var id = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                              nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
+            DispatchQueue.main.async { HotKeys.shared.actions[id.id]?() }
+            return noErr
+        }, 1, &spec, nil, nil)
+    }
+
+    func removeAll() { refs.forEach { UnregisterEventHotKey($0) }; refs = []; actions = [:] }
+
+    /// false when another app already holds the same shortcut.
+    func register(_ combo: KeyCombo, id: UInt32, action: @escaping () -> Void) -> Bool {
+        installHandler()
+        var ref: EventHotKeyRef?
+        let status = RegisterEventHotKey(combo.keyCode, combo.carbonModifiers, EventHotKeyID(signature: OSType(0x434C5052), id: id),
+                                         GetApplicationEventTarget(), OptionBits(kEventHotKeyExclusive), &ref)
+        guard status == noErr, let ref else { return false }
+        refs.append(ref); actions[id] = action; return true
+    }
+}
+
 // MARK: - Helper app
 
 final class Helper: NSObject, NSApplicationDelegate {
@@ -339,9 +444,44 @@ final class Helper: NSObject, NSApplicationDelegate {
         item.button?.image = critterIcon()
         item.button?.setAccessibilityLabel("Claude Profiles")
         statusItem = item
-        buildMenu(); claimHandler(); ready = true; drain()
+        reloadConfig(); claimHandler(); ready = true; drain()
         // Claude Desktop re-registers itself for claude:// on launch; take the scheme back.
-        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.claimHandler() }
+        // The same tick picks up edits to profiles.json.
+        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.claimHandler(); self?.reloadIfConfigChanged()
+        }
+    }
+
+    private var configStamp: Date?
+    /// Shortcuts that could not be registered because another app holds them, by profile id.
+    private var takenShortcuts: [String: String] = [:]
+
+    private func reloadIfConfigChanged() {
+        let stamp = (try? FileManager.default.attributesOfItem(atPath: Config.path))?[.modificationDate] as? Date
+        if stamp != configStamp { reloadConfig() }
+    }
+
+    private func reloadConfig() {
+        configStamp = (try? FileManager.default.attributesOfItem(atPath: Config.path))?[.modificationDate] as? Date
+        HotKeys.shared.removeAll(); takenShortcuts = [:]
+        if let c = try? Config.load() {
+            for (n, p) in c.profiles.enumerated() {
+                guard let combo = KeyCombo.for(p, position: n) else { continue }
+                let id = p.id
+                if !HotKeys.shared.register(combo, id: UInt32(n + 1), action: { [weak self] in self?.summon(id) }) {
+                    takenShortcuts[p.id] = combo.display
+                }
+            }
+        }
+        buildMenu()
+    }
+
+    /// Shortcut / menu action: start a closed profile, bring a background one forward, hide a frontmost one.
+    func summon(_ id: String) {
+        guard let c = try? Config.load(), let p = c.profiles.first(where: { $0.id == id }) else { return }
+        if let app = runningProfiles(c)[id] {
+            if app.isActive { app.hide() } else { bringForward(app) }
+        } else { try? launch(p, c) }
     }
 
     func applicationWillTerminate(_ n: Notification) {
@@ -356,17 +496,24 @@ final class Helper: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         if let c = try? Config.load() {
             let running = runningProfiles(c)
-            for p in c.profiles {
+            for (n, p) in c.profiles.enumerated() {
                 let item = menu.addItem(withTitle: p.name, action: #selector(openProfile(_:)), keyEquivalent: "")
-                item.target = self; item.representedObject = p.id; item.state = running[p.id] != nil ? .on : .off
+                item.target = self; item.representedObject = p.id
+                // A green dot marks a running profile, like the Dock's running indicator.
+                item.onStateImage = runningDot; item.offStateImage = nil
+                item.state = running[p.id] != nil ? .on : .off
                 let img = icon(for: p, c); img.size = NSSize(width: 18, height: 18); item.image = img
+                if let taken = takenShortcuts[p.id] {
+                    item.title = p.name + "  " + L("(\(taken) is taken)", "(\(taken) занято)")
+                } else if let combo = KeyCombo.for(p, position: n), !combo.menuKey.isEmpty {
+                    item.keyEquivalent = combo.menuKey; item.keyEquivalentModifierMask = combo.menuModifiers
+                }
             }
         } else {
             let bad = menu.addItem(withTitle: L("profiles.json is missing or invalid", "profiles.json не найден или битый"), action: nil, keyEquivalent: "")
             bad.isEnabled = false
         }
         menu.addItem(.separator())
-        menu.addItem(withTitle: L("Preview Chooser…", "Показать окно выбора…"), action: #selector(showPreview), keyEquivalent: "").target = self
         menu.addItem(withTitle: L("Edit Profiles…", "Настроить профили…"), action: #selector(editConfig), keyEquivalent: "").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: L("Quit", "Выйти"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -375,10 +522,17 @@ final class Helper: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openProfile(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String, let c = try? Config.load(),
-              let p = c.profiles.first(where: { $0.id == id }) else { return }
-        if let app = runningProfiles(c)[id] { app.activate(options: [.activateAllWindows]) } else { try? launch(p, c) }
+        guard let id = sender.representedObject as? String else { return }
+        summon(id)
     }
+
+    private lazy var runningDot: NSImage = {
+        let image = NSImage(size: NSSize(width: 10, height: 10), flipped: false) { r in
+            NSColor.systemGreen.setFill(); NSBezierPath(ovalIn: r.insetBy(dx: 1.5, dy: 1.5)).fill(); return true
+        }
+        image.isTemplate = false
+        return image
+    }()
 
     @objc private func editConfig() {
         // .json usually belongs to Xcode; a plain text editor is what people expect here.
@@ -480,15 +634,7 @@ if let i = args.firstIndex(of: "--open"), i + 1 < args.count {
     guard let c = try? Config.load(), let p = c.profiles.first(where: { $0.id == args[i + 1] }) else {
         print("unknown profile \(args[i + 1])"); exit(1)
     }
-    if let app = runningProfiles(c)[p.id] {
-        // 'aevt/rapp' is what a Dock click sends: a hidden or windowless Claude shows its window again.
-        let reopen = NSAppleEventDescriptor(eventClass: AEEventClass(kCoreEventClass), eventID: AEEventID(kAEReopenApplication),
-                                            targetDescriptor: NSAppleEventDescriptor(processIdentifier: app.processIdentifier),
-                                            returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
-        _ = try? reopen.sendEvent(options: [.noReply], timeout: 5)
-        app.unhide(); app.activate(options: [.activateAllWindows])
-        exit(0)
-    }
+    if let app = runningProfiles(c)[p.id] { bringForward(app); exit(0) }
     do { try launch(p, c); exit(0) } catch { print(error); exit(1) }
 }
 if let i = args.firstIndex(of: "--make-launcher"), i + 2 < args.count {
