@@ -25,7 +25,19 @@ The script builds the helper from source, installs it to `~/Applications/Claude 
 
 ## Configure
 
-`~/Library/Application Support/Claude Profiles/profiles.json` (menu bar icon → *Edit Profiles…*):
+Menu bar icon → **Settings…** (⌘,):
+
+- rename a profile by clicking its name;
+- click a profile's icon to pick its colour: each new profile gets the next one automatically (orange, blue, green, yellow, purple, pink, teal, graphite), and its Dock icon is repainted to match;
+- click a shortcut and press new keys (Delete turns it off, Esc cancels);
+- **Add Profile…** creates a new profile with its own data folder, `~/Library/Application Support/Claude-<name>`; start it once and sign in;
+- **Add to Dock** makes a small launcher app for the profile (`/Applications/Claude <name>.app`) and pins it; click again to unpin;
+- the − button removes a profile from the list and moves its Dock launcher to the Trash, but keeps its data folder, so nothing is lost;
+- choose whether links should always ask, even with one profile running.
+
+Changes apply immediately. The standard profile is the Claude you already have: it uses Claude's usual data folder and cannot be removed.
+
+Everything is stored in `~/Library/Application Support/Claude Profiles/profiles.json`, which you can also edit by hand:
 
 ```json
 {
@@ -39,7 +51,8 @@ The script builds the helper from source, installs it to `~/Applications/Claude 
 ```
 
 - A profile without `userDataDir` is Claude's stock profile.
-- `icon` (optional) is a path to an `.app` or image used in the chooser.
+- `color` (optional) is one of `orange`, `blue`, `green`, `yellow`, `purple`, `pink`, `teal`, `graphite`; without it profiles take the palette in order.
+- `icon` (optional) is a path to an `.app` or `.icns` that replaces the coloured Claude icon.
 - `alwaysAsk: true` shows the chooser even when only one profile is open.
 - `hotkey` sets a global shortcut for the profile, for example `"ctrl+opt+1"` or `"ctrl+opt+w"`; `"none"` turns it off. Without it, the first nine profiles get **⌃⌥1 … ⌃⌥9** in list order: three keys under one hand, and macOS itself assigns nothing to ⌃⌥ with a digit. Modifiers: `ctrl`, `opt`, `cmd`, `shift`; keys: letters, digits, `f1`–`f12`, `space`.
 
@@ -53,7 +66,7 @@ Press a profile's shortcut from anywhere:
 - open in the background → its window comes to the front;
 - already in front → it hides, so the same keys toggle it.
 
-The menu bar menu shows each profile's shortcut and a green dot next to the profiles that are running. If another app already owns a shortcut, the menu says so; pick a different one in `profiles.json`. No Accessibility permission is needed.
+The menu bar menu shows each profile's shortcut and a green dot next to the profiles that are running. If another app already owns a shortcut, the menu and Settings show it in red; pick a different one in Settings. No Accessibility permission is needed.
 
 To start a profile by hand: `open -n -a Claude --args --user-data-dir="$HOME/Library/Application Support/Claude-Work"`.
 
@@ -74,14 +87,14 @@ A launcher focuses the profile when it is already running instead of starting a 
 
 ## Dock setup
 
-Make a launcher for **every** profile, including the default one, and pin the launchers instead of `Claude.app`:
+Use **Add to Dock** in Settings for **every** profile, including the standard one, and unpin `Claude.app` itself. From the command line:
 
 ```sh
 "$CP" --make-launcher default "/Applications/Claude Personal.app" /Applications/Claude.app/Contents/Resources/electron.icns
 "$CP" --make-launcher work    "/Applications/Claude Work.app"     ~/Pictures/work.icns
 ```
 
-Then drag both into the Dock and remove the `Claude.app` pin.
+Then drag them into the Dock and remove the `Claude.app` pin.
 
 Why: all profiles are instances of the same `Claude.app`, so its Dock icon cannot tell them apart. With two profiles open, clicking it may do nothing or bring up the wrong one. A launcher targets its profile's exact process, so each Dock icon always opens its own window. While a profile is running, macOS also shows a regular Claude icon for it in the Dock. That is expected.
 

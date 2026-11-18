@@ -33,6 +33,10 @@ struct Profile: Codable, Equatable {
     /// Global shortcut such as "ctrl+opt+1"; "none" turns it off. Missing means the default
     /// ⌃⌥<position> for the first nine profiles.
     var hotkey: String?
+    /// Dock launcher app made for this profile (Settings → Add to Dock).
+    var launcher: String?
+    /// Tint of the Claude icon for this profile (see ProfileColor). Missing means "next in the palette".
+    var color: String?
 
     var dataDir: String? {
         guard let d = userDataDir, !d.isEmpty else { return nil }
@@ -57,6 +61,11 @@ struct Config: Codable {
         let c = try JSONDecoder().decode(Config.self, from: data)
         guard !c.profiles.isEmpty else { throw NSError(domain: "ClaudeProfiles", code: 1) }
         return c
+    }
+
+    func save() throws {
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .withoutEscapingSlashes]
+        try encoder.encode(self).write(to: URL(fileURLWithPath: Config.path), options: .atomic)
     }
 }
 
@@ -157,11 +166,106 @@ func alert(_ title: String, _ text: String) {
 
 // MARK: - Chooser window
 
+/// The Claude icon, recoloured per profile by rotating its hue. Orange is Claude's own colour.
+enum ProfileColor: String, CaseIterable {
+    case orange, blue, green, yellow, purple, pink, teal, graphite
+
+    /// Hue rotation from Claude's orange, in degrees.
+    var hueShift: Double {
+        switch self {
+        case .orange: return 0
+        case .blue: return 195
+        case .green: return 110
+        case .yellow: return 40
+        case .purple: return 255
+        case .pink: return 310
+        case .teal: return 160
+        case .graphite: return 0
+        }
+    }
+    /// Saturation and brightness tweaks after the hue rotation (plain rotation leaves yellow muddy).
+    var saturation: Double { self == .yellow ? 1.25 : self == .graphite ? 0 : 1 }
+    var brightness: Double { self == .yellow ? 0.10 : self == .graphite ? -0.12 : 0 }
+    var title: String {
+        switch self {
+        case .orange: return L("Orange", "Оранжевый")
+        case .blue: return L("Blue", "Синий")
+        case .green: return L("Green", "Зелёный")
+        case .yellow: return L("Yellow", "Жёлтый")
+        case .purple: return L("Purple", "Фиолетовый")
+        case .pink: return L("Pink", "Розовый")
+        case .teal: return L("Teal", "Бирюзовый")
+        case .graphite: return L("Graphite", "Графитовый")
+        }
+    }
+
+    /// Explicit colour, or the next one in the palette by the profile's position.
+    static func of(_ p: Profile, in c: Config) -> ProfileColor {
+        if let raw = p.color, let col = ProfileColor(rawValue: raw) { return col }
+        let n = c.profiles.firstIndex(where: { $0.id == p.id }) ?? 0
+        return allCases[n % allCases.count]
+    }
+}
+
+private var tintCache: [String: NSImage] = [:]
+
+func tintedClaudeIcon(_ color: ProfileColor, appPath: String) -> NSImage {
+    if let hit = tintCache[color.rawValue] { return hit }
+    let base = NSWorkspace.shared.icon(forFile: appPath)
+    var rect = NSRect(x: 0, y: 0, width: 1024, height: 1024)
+    guard color != .orange, let cg = base.cgImage(forProposedRect: &rect, context: nil, hints: nil) else {
+        tintCache[color.rawValue] = base; return base
+    }
+    let hue = CIFilter(name: "CIHueAdjust")!
+    hue.setValue(CIImage(cgImage: cg), forKey: kCIInputImageKey)
+    hue.setValue(color.hueShift * .pi / 180, forKey: kCIInputAngleKey)
+    let tone = CIFilter(name: "CIColorControls")!
+    tone.setValue(hue.outputImage, forKey: kCIInputImageKey)
+    tone.setValue(color.saturation, forKey: kCIInputSaturationKey)
+    tone.setValue(color.brightness, forKey: kCIInputBrightnessKey)
+    guard let out = tone.outputImage, let full = hue.outputImage?.extent,
+          let shifted = CIContext().createCGImage(out, from: full) else { return base }
+    let image = NSImage(cgImage: shifted, size: NSSize(width: 1024, height: 1024))
+    tintCache[color.rawValue] = image
+    return image
+}
+
+/// .icns bytes for an image, via iconutil.
+func icnsData(_ image: NSImage) -> Data? {
+    let fm = FileManager.default
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    let set = dir.appendingPathComponent("icon.iconset"), out = dir.appendingPathComponent("icon.icns")
+    defer { try? fm.removeItem(at: dir) }
+    do {
+        try fm.createDirectory(at: set, withIntermediateDirectories: true)
+        for size in [16, 32, 64, 128, 256, 512, 1024] {
+            let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: size, pixelsHigh: size, bitsPerSample: 8, samplesPerPixel: 4,
+                                       hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+            NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            NSGraphicsContext.current?.imageInterpolation = .high
+            image.draw(in: NSRect(x: 0, y: 0, width: size, height: size), from: .zero, operation: .copy, fraction: 1)
+            NSGraphicsContext.restoreGraphicsState()
+            guard let png = rep.representation(using: .png, properties: [:]) else { return nil }
+            if size <= 512 { try png.write(to: set.appendingPathComponent("icon_\(size)x\(size).png")) }
+            if size >= 32 { try png.write(to: set.appendingPathComponent("icon_\(size / 2)x\(size / 2)@2x.png")) }
+        }
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil"); p.arguments = ["-c", "icns", set.path, "-o", out.path]
+        try p.run(); p.waitUntilExit()
+        return p.terminationStatus == 0 ? fm.contents(atPath: out.path) : nil
+    } catch { return nil }
+}
+
+/// Icon shown for a profile: an explicit `icon` file if set, otherwise Claude's icon in the profile's colour.
 func icon(for p: Profile, _ c: Config) -> NSImage {
     if let path = p.icon.map({ ($0 as NSString).expandingTildeInPath }), FileManager.default.fileExists(atPath: path) {
         return path.hasSuffix(".app") ? NSWorkspace.shared.icon(forFile: path) : (NSImage(contentsOfFile: path) ?? NSWorkspace.shared.icon(forFile: c.appPath))
     }
-    return NSWorkspace.shared.icon(forFile: c.appPath)
+    return tintedClaudeIcon(ProfileColor.of(p, in: c), appPath: c.appPath)
+}
+
+/// A resized copy, so shared cached icons are never mutated.
+func sized(_ image: NSImage, _ side: CGFloat) -> NSImage {
+    let copy = image.copy() as! NSImage; copy.size = NSSize(width: side, height: side); return copy
 }
 
 final class ProfileCard: NSButton {
@@ -345,6 +449,9 @@ struct KeyCombo {
     let menuModifiers: NSEvent.ModifierFlags
     let display: String
 
+    /// Config name of a key ("1", "w", "f5", "space") for a virtual key code, nil if unsupported.
+    static func keyName(for code: UInt16) -> String? { keys.first(where: { $0.value == Int(code) })?.key }
+
     private static let keys: [String: Int] = {
         var k: [String: Int] = [
             "0": kVK_ANSI_0, "1": kVK_ANSI_1, "2": kVK_ANSI_2, "3": kVK_ANSI_3, "4": kVK_ANSI_4,
@@ -423,6 +530,442 @@ final class HotKeys {
     }
 }
 
+// MARK: - Dock launchers
+
+/// Where a profile's launcher lives: the recorded path, or /Applications/Claude <Name>.app.
+func launcherPath(for p: Profile) -> String {
+    if let l = p.launcher, !l.isEmpty { return (l as NSString).expandingTildeInPath }
+    let safe = p.name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+    return "/Applications/Claude \(safe).app"
+}
+
+/// Icon bytes for a profile's launcher: its own icon (.app or .icns), else Claude's.
+/// Read up front, because the icon may live inside the launcher that is about to be rebuilt.
+func launcherIconData(for p: Profile, _ c: Config) -> Data? {
+    func bundleIcon(_ app: String) -> Data? {
+        guard let b = Bundle(path: app), var name = b.object(forInfoDictionaryKey: "CFBundleIconFile") as? String else { return nil }
+        if !name.hasSuffix(".icns") { name += ".icns" }
+        return FileManager.default.contents(atPath: app + "/Contents/Resources/" + name)
+    }
+    if let icon = p.icon.map({ ($0 as NSString).expandingTildeInPath }) {
+        if icon.hasSuffix(".app"), let d = bundleIcon(icon) { return d }
+        if icon.hasSuffix(".icns"), let d = FileManager.default.contents(atPath: icon) { return d }
+    }
+    let color = ProfileColor.of(p, in: c)
+    return color == .orange ? bundleIcon(c.appPath) : icnsData(tintedClaudeIcon(color, appPath: c.appPath))
+}
+
+/// A tiny app that runs `ClaudeProfiles --open <id>`: focuses the profile or starts it.
+/// Updated in place, never deleted and recreated: the Dock keeps a bookmark to the bundle itself,
+/// and a recreated bundle leaves that bookmark dangling (the tile vanishes or keeps the old picture).
+func makeLauncher(id: String, at dest: String, icon: Data?) throws {
+    let fm = FileManager.default, contents = dest + "/Contents", resources = contents + "/Resources"
+    try fm.createDirectory(atPath: contents + "/MacOS", withIntermediateDirectories: true)
+    try fm.createDirectory(atPath: resources, withIntermediateDirectories: true)
+    let me = Bundle.main.executablePath ?? CommandLine.arguments[0]
+    let script = "#!/bin/sh\nexec \"\(me)\" --open '\(id.replacingOccurrences(of: "'", with: ""))'\n"
+    try script.write(toFile: contents + "/MacOS/launch", atomically: true, encoding: .utf8)
+    try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: contents + "/MacOS/launch")
+    var info: [String: Any] = [
+        "CFBundleName": ((dest as NSString).lastPathComponent as NSString).deletingPathExtension,
+        "CFBundleIdentifier": helperBundleID + ".launcher." + id,
+        "CFBundleExecutable": "launch", "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": "1.0", "LSUIElement": true,
+    ]
+    // A fresh icon file name per picture, so macOS cannot serve the previous one from its icon cache.
+    for old in (try? fm.contentsOfDirectory(atPath: resources)) ?? [] where old.hasPrefix("AppIcon") {
+        try? fm.removeItem(atPath: resources + "/" + old)
+    }
+    if let icon {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for b in icon { hash = (hash ^ UInt64(b)) &* 0x100000001b3 }
+        let name = "AppIcon-" + String(hash, radix: 16).prefix(10)
+        try icon.write(to: URL(fileURLWithPath: resources + "/" + name + ".icns")); info["CFBundleIconFile"] = name
+    }
+    try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        .write(to: URL(fileURLWithPath: contents + "/Info.plist"))
+    // Tell Launch Services and Finder that the bundle changed.
+    let ls = Process()
+    ls.executableURL = URL(fileURLWithPath: "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister")
+    ls.arguments = ["-f", dest]; try? ls.run(); ls.waitUntilExit()
+    try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: dest)
+    NSWorkspace.shared.noteFileSystemChanged(dest)
+}
+
+enum Dock {
+    private static let domain = "com.apple.dock" as CFString, key = "persistent-apps" as CFString
+
+    /// Always re-read from disk: a long-running process otherwise keeps a stale cached copy of the Dock's prefs,
+    /// and writing that copy back would undo changes made since (including the Dock's own).
+    private static func items() -> [[String: Any]] {
+        CFPreferencesAppSynchronize(domain)
+        return CFPreferencesCopyAppValue(key, domain) as? [[String: Any]] ?? []
+    }
+    private static func path(of item: [String: Any]) -> String? {
+        guard let tile = item["tile-data"] as? [String: Any], let file = tile["file-data"] as? [String: Any],
+              let s = file["_CFURLString"] as? String, let u = URL(string: s) else { return nil }
+        return norm(u.standardizedFileURL.path)
+    }
+    /// The Dock stores paths decomposed ("й" as и + breve); compare in one Unicode form or non-Latin names never match.
+    private static func norm(_ p: String) -> String {
+        URL(fileURLWithPath: p).standardizedFileURL.path.precomposedStringWithCanonicalMapping
+    }
+
+    static func contains(_ app: String) -> Bool { items().contains { path(of: $0) == norm(app) } }
+
+    /// Makes the Dock re-resolve a pinned app by path and re-read its icon.
+    static func reload(_ app: String) {
+        var list = items(); let target = norm(app); var changed = false
+        for i in list.indices where path(of: list[i]) == target {
+            if var tile = list[i]["tile-data"] as? [String: Any] { tile.removeValue(forKey: "book"); list[i]["tile-data"] = tile; changed = true }
+        }
+        if changed { CFPreferencesSetAppValue(key, list as CFPropertyList, domain); CFPreferencesAppSynchronize(domain) }
+        refresh()
+    }
+
+    /// Restarts the Dock so it re-reads icons.
+    static func refresh() {
+        let k = Process(); k.executableURL = URL(fileURLWithPath: "/usr/bin/killall"); k.arguments = ["Dock"]; try? k.run()
+    }
+
+    /// Pins or unpins an app and restarts the Dock so it shows up at once.
+    static func set(_ app: String, pinned: Bool) {
+        var list = items(), target = norm(app)
+        if pinned {
+            guard !list.contains(where: { path(of: $0) == target }) else { return }
+            list.append(["tile-type": "file-tile", "tile-data": [
+                "file-data": ["_CFURLString": URL(fileURLWithPath: target).absoluteString, "_CFURLStringType": 15],
+                "file-label": ((target as NSString).lastPathComponent as NSString).deletingPathExtension]])
+        } else {
+            let before = list.count; list.removeAll { path(of: $0) == target }; guard list.count != before else { return }
+        }
+        CFPreferencesSetAppValue(key, list as CFPropertyList, domain); CFPreferencesAppSynchronize(domain)
+        refresh()
+    }
+}
+
+// MARK: - Settings window
+
+/// Pill that records a shortcut: click it, press keys. Esc cancels, Delete turns the shortcut off.
+final class ShortcutField: NSButton {
+    var value: String?            // as stored in profiles.json; nil = default
+    var defaultCombo: KeyCombo?   // what nil means for this profile
+    var taken = false
+    var onRecordStart: (() -> Void)?
+    var onChange: ((String?) -> Void)?
+    var onRecordEnd: (() -> Void)?
+    private var monitor: Any?
+    private var recording = false { didSet { refresh() } }
+
+    init() {
+        super.init(frame: .zero)
+        bezelStyle = .rounded; setButtonType(.momentaryPushIn); target = self; action = #selector(toggle)
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 130).isActive = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func refresh() {
+        let text: String, color: NSColor
+        if recording { text = L("Type shortcut…", "Нажми сочетание…"); color = .controlAccentColor }
+        else if value?.lowercased() == "none" { text = L("None", "Нет"); color = .tertiaryLabelColor }
+        else if let v = value, let c = KeyCombo(v) { text = c.display; color = taken ? .systemRed : .labelColor }
+        else if value == nil, let d = defaultCombo { text = d.display; color = taken ? .systemRed : .labelColor }
+        else { text = L("None", "Нет"); color = .tertiaryLabelColor }
+        attributedTitle = NSAttributedString(string: text, attributes: [
+            .foregroundColor: color, .font: NSFont.monospacedSystemFont(ofSize: 13, weight: recording ? .regular : .medium)])
+        toolTip = taken ? L("Another app already uses this shortcut", "Это сочетание уже занято другим приложением") : nil
+    }
+
+    @objc private func toggle() { recording ? stop() : start() }
+
+    private func start() {
+        onRecordStart?(); recording = true
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown]) { [weak self] e in
+            guard let self else { return e }
+            if e.type == .leftMouseDown { if e.window !== self.window || !self.frame.contains(self.convert(e.locationInWindow, from: nil)) { self.stop() }; return e }
+            self.handle(e); return nil
+        }
+    }
+
+    private func stop() {
+        if let m = monitor { NSEvent.removeMonitor(m) }; monitor = nil
+        if recording { recording = false; onRecordEnd?() }
+    }
+
+    private func handle(_ e: NSEvent) {
+        switch Int(e.keyCode) {
+        case kVK_Escape: stop(); return
+        case kVK_Delete, kVK_ForwardDelete: value = "none"; stop(); onChange?(value); return
+        default: break
+        }
+        let f = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        var parts: [String] = []
+        if f.contains(.control) { parts.append("ctrl") }
+        if f.contains(.option) { parts.append("opt") }
+        if f.contains(.shift) { parts.append("shift") }
+        if f.contains(.command) { parts.append("cmd") }
+        guard let key = KeyCombo.keyName(for: e.keyCode) else { NSSound.beep(); return }
+        let text = (parts + [key]).joined(separator: "+")
+        guard KeyCombo(text) != nil else { NSSound.beep(); return }  // needs a modifier unless it is an F-key
+        value = text; taken = false; stop(); onChange?(value)
+    }
+}
+
+/// Rounded card that follows light/dark appearance.
+final class CardView: NSView {
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        layer?.cornerRadius = 10; layer?.borderWidth = 1
+        layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        layer?.borderColor = NSColor.separatorColor.cgColor
+    }
+}
+
+final class SettingsWindow: NSObject, NSWindowDelegate, NSTextFieldDelegate {
+    private var window: NSWindow?
+    private var config: Config!
+    private var taken: [String: String] = [:]
+    /// Called after every saved change so the helper re-registers shortcuts and rebuilds its menu.
+    var onSave: (() -> Void)?
+    var currentTaken: (() -> [String: String])?
+    var onClose: (() -> Void)?
+
+    func show() {
+        guard let c = try? Config.load() else {
+            alert(L("Claude Profiles is not configured", "Claude Profiles не настроен"), Config.path); return
+        }
+        config = c; taken = currentTaken?() ?? [:]
+        if window == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 300), styleMask: [.titled, .closable],
+                             backing: .buffered, defer: false)
+            w.title = L("Claude Profiles Settings", "Настройки Claude Profiles"); w.isReleasedWhenClosed = false; w.delegate = self
+            window = w
+        }
+        rebuild()
+        window?.center(); NSApp.activate(ignoringOtherApps: true); window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(nil)  // do not start with a name selected for editing
+    }
+
+    func windowWillClose(_ n: Notification) { window?.makeFirstResponder(nil); onClose?() }
+
+    /// The Dock and profiles.json can change behind the window's back; re-read them whenever it comes forward.
+    func windowDidBecomeKey(_ n: Notification) {
+        guard !dockBusy, !(window?.firstResponder is NSTextView), let fresh = try? Config.load() else { return }
+        config = fresh; taken = currentTaken?() ?? [:]; rebuild()
+    }
+
+    /// True for a moment after a Dock change: the restarting Dock rewrites its own prefs, and a second
+    /// change in that window would be undone.
+    private var dockBusy = false
+    private func settleDock(_ sender: NSButton) {
+        dockBusy = true; sender.isEnabled = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in self?.dockBusy = false; self?.rebuild() }
+    }
+
+    private func save() {
+        do { try config.save() } catch { alert(L("Could not save settings", "Не удалось сохранить настройки"), error.localizedDescription) }
+        onSave?(); taken = currentTaken?() ?? [:]
+    }
+
+    private func rebuild() {
+        guard let window else { return }
+        let root = NSView(); root.translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
+        stack.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 20, right: 24); stack.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(stack)
+
+        let title = NSTextField(labelWithString: L("Profiles", "Профили")); title.font = .systemFont(ofSize: 17, weight: .semibold)
+        stack.addArrangedSubview(title)
+        let hint = NSTextField(wrappingLabelWithString: L(
+            "Click a shortcut and press new keys. Delete turns it off, Esc cancels.",
+            "Нажми на сочетание и введи новое. Delete — отключить, Esc — отмена."))
+        hint.font = .systemFont(ofSize: 12); hint.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(hint); stack.setCustomSpacing(16, after: hint)
+
+        for (n, p) in config.profiles.enumerated() {
+            let row = profileRow(p, position: n); stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -48).isActive = true
+        }
+
+        let add = NSButton(title: L("Add Profile…", "Добавить профиль…"), target: self, action: #selector(addProfile))
+        add.bezelStyle = .rounded; add.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil); add.imagePosition = .imageLeading
+        stack.addArrangedSubview(add); stack.setCustomSpacing(20, after: add)
+
+        let sep = NSBox(); sep.boxType = .separator; stack.addArrangedSubview(sep)
+        sep.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -48).isActive = true
+
+        let ask = NSButton(checkboxWithTitle: L("Ask where to open links even when one profile is running",
+                                                 "Спрашивать, куда открыть ссылку, даже если запущен один профиль"),
+                           target: self, action: #selector(toggleAlwaysAsk(_:)))
+        ask.state = config.alwaysAsk == true ? .on : .off
+        stack.addArrangedSubview(ask)
+
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: root.topAnchor), stack.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor), stack.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            root.widthAnchor.constraint(equalToConstant: 600),
+        ])
+        window.contentView = root
+        root.layoutSubtreeIfNeeded()
+        window.setContentSize(root.fittingSize)
+    }
+
+    private func profileRow(_ p: Profile, position: Int) -> NSView {
+        let card = CardView(); card.wantsLayer = true; card.translatesAutoresizingMaskIntoConstraints = false
+
+        let img = NSButton(image: sized(icon(for: p, config), 36), target: self, action: #selector(pickColor(_:)))
+        img.isBordered = false; img.imageScaling = .scaleProportionallyUpOrDown
+        img.identifier = NSUserInterfaceItemIdentifier(p.id); img.toolTip = L("Change colour", "Сменить цвет")
+        img.translatesAutoresizingMaskIntoConstraints = false
+        img.widthAnchor.constraint(equalToConstant: 36).isActive = true; img.heightAnchor.constraint(equalToConstant: 36).isActive = true
+
+        let name = NSTextField(string: p.name); name.font = .systemFont(ofSize: 14, weight: .semibold)
+        name.isBordered = false; name.drawsBackground = false; name.focusRingType = .none; name.delegate = self
+        name.identifier = NSUserInterfaceItemIdentifier(p.id); name.placeholderString = L("Name", "Название")
+        name.toolTip = L("Click to rename", "Нажми, чтобы переименовать")
+        let path = NSTextField(labelWithString: p.dataDir.map { ($0 as NSString).abbreviatingWithTildeInPath }
+                                                ?? L("Standard Claude profile", "Стандартный профиль Claude"))
+        path.font = .systemFont(ofSize: 11); path.textColor = .secondaryLabelColor; path.lineBreakMode = .byTruncatingMiddle
+        path.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let texts = NSStackView(views: [name, path]); texts.orientation = .vertical; texts.alignment = .leading; texts.spacing = 2
+        texts.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let field = ShortcutField()
+        field.value = p.hotkey; field.defaultCombo = position < 9 ? KeyCombo("ctrl+opt+\(position + 1)") : nil
+        field.taken = taken[p.id] != nil; field.refresh()
+        field.onRecordStart = { HotKeys.shared.removeAll() }   // so the old keys do not fire while recording
+        field.onRecordEnd = { [weak self] in self?.onSave?() }
+        field.onChange = { [weak self] v in self?.update(p.id) { $0.hotkey = v }; self?.save() }
+
+        let inDock = Dock.contains(launcherPath(for: p))
+        let dock = NSButton(title: inDock ? L("In Dock", "В Доке") : L("Add to Dock", "В Док"), target: self, action: #selector(toggleDock(_:)))
+        dock.bezelStyle = .rounded; dock.controlSize = .small; dock.font = .systemFont(ofSize: 11)
+        dock.image = NSImage(systemSymbolName: inDock ? "checkmark" : "dock.rectangle", accessibilityDescription: nil)
+        dock.imagePosition = .imageLeading; dock.identifier = NSUserInterfaceItemIdentifier(p.id)
+        dock.toolTip = inDock ? L("Click to remove its icon from the Dock", "Нажми, чтобы убрать значок из Дока")
+                              : L("Pin an icon that opens this profile", "Закрепить в Доке значок, который открывает этот профиль")
+        var views: [NSView] = [img, texts, field, dock]
+        if p.dataDir != nil {
+            let remove = NSButton(image: NSImage(systemSymbolName: "minus.circle", accessibilityDescription: L("Remove", "Удалить"))!,
+                                  target: self, action: #selector(removeProfile(_:)))
+            remove.isBordered = false; remove.contentTintColor = .secondaryLabelColor
+            remove.identifier = NSUserInterfaceItemIdentifier(p.id); remove.toolTip = L("Remove profile", "Удалить профиль")
+            remove.translatesAutoresizingMaskIntoConstraints = false
+            remove.widthAnchor.constraint(equalToConstant: 20).isActive = true
+            views.append(remove)
+        } else {
+            // The standard profile cannot be removed; keep its shortcut aligned with the others.
+            let gap = NSView(); gap.translatesAutoresizingMaskIntoConstraints = false
+            gap.widthAnchor.constraint(equalToConstant: 20).isActive = true
+            views.append(gap)
+        }
+        let row = NSStackView(views: views); row.orientation = .horizontal; row.spacing = 12; row.alignment = .centerY
+        row.distribution = .fill
+        row.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            row.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            row.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
+            row.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10),
+        ])
+        return card
+    }
+
+    private func update(_ id: String, _ change: (inout Profile) -> Void) {
+        guard let i = config.profiles.firstIndex(where: { $0.id == id }) else { return }
+        change(&config.profiles[i])
+    }
+
+    func controlTextDidEndEditing(_ n: Notification) {
+        guard let f = n.object as? NSTextField, let id = f.identifier?.rawValue else { return }
+        let name = f.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { f.stringValue = config.profiles.first(where: { $0.id == id })?.name ?? ""; return }
+        if config.profiles.first(where: { $0.id == id })?.name != name { update(id) { $0.name = name }; save() }
+    }
+
+    @objc private func toggleAlwaysAsk(_ sender: NSButton) { config.alwaysAsk = sender.state == .on ? true : nil; save() }
+
+    @objc private func addProfile() {
+        let a = NSAlert(); a.messageText = L("New profile", "Новый профиль")
+        a.informativeText = L("It gets its own Claude account, chats and settings.", "У него будут свой аккаунт Claude, чаты и настройки.")
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24)); input.placeholderString = L("Name, e.g. Side project", "Название, например «Пет-проект»")
+        a.accessoryView = input; a.addButton(withTitle: L("Add", "Добавить")); a.addButton(withTitle: L("Cancel", "Отмена"))
+        a.window.initialFirstResponder = input
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        let name = input.stringValue.trimmingCharacters(in: .whitespaces); guard !name.isEmpty else { return }
+        let latin = (name.applyingTransform(.toLatin, reverse: false) ?? name).applyingTransform(.stripDiacritics, reverse: false) ?? name
+        var slug = latin.lowercased().map { $0.isLetter || $0.isNumber ? String($0) : "-" }.joined()
+            .split(separator: "-").joined(separator: "-")
+        if slug.isEmpty { slug = "profile" }
+        var id = slug, n = 2
+        while config.profiles.contains(where: { $0.id == id }) { id = "\(slug)-\(n)"; n += 1 }
+        let folder = "~/Library/Application Support/Claude-" + id
+        config.profiles.append(Profile(id: id, name: name, userDataDir: folder, icon: nil, hotkey: nil))
+        save(); rebuild()
+    }
+
+    @objc private func pickColor(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue, let p = config.profiles.first(where: { $0.id == id }) else { return }
+        let current = ProfileColor.of(p, in: config)
+        let menu = NSMenu()
+        for col in ProfileColor.allCases {
+            let item = NSMenuItem(title: col.title, action: #selector(colorChosen(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = [id, col.rawValue]; item.state = col == current && p.icon == nil ? .on : .off
+            item.image = sized(tintedClaudeIcon(col, appPath: config.appPath), 18)
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    @objc private func colorChosen(_ sender: NSMenuItem) {
+        guard let pair = sender.representedObject as? [String], pair.count == 2 else { return }
+        let id = pair[0]
+        update(id) { $0.color = pair[1]; $0.icon = nil }
+        save()
+        // Repaint the profile's Dock launcher too.
+        if let p = config.profiles.first(where: { $0.id == id }), let l = p.launcher {
+            let app = (l as NSString).expandingTildeInPath
+            if FileManager.default.fileExists(atPath: app) {
+                try? makeLauncher(id: id, at: app, icon: launcherIconData(for: p, config))
+                if Dock.contains(app) { Dock.reload(app) }
+            }
+        }
+        rebuild()
+    }
+
+    @objc private func toggleDock(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue, let p = config.profiles.first(where: { $0.id == id }) else { return }
+        guard !dockBusy else { return }
+        let app = launcherPath(for: p)
+        if Dock.contains(app) { Dock.set(app, pinned: false); settleDock(sender); return }
+        do {
+            let icon = launcherIconData(for: p, config)
+            try makeLauncher(id: p.id, at: app, icon: icon)
+            update(id) { $0.launcher = app }
+            save(); Dock.set(app, pinned: true); settleDock(sender)
+        } catch {
+            alert(L("Could not create the Dock icon", "Не получилось создать значок для Дока"), error.localizedDescription)
+            rebuild()
+        }
+    }
+
+    @objc private func removeProfile(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue, let p = config.profiles.first(where: { $0.id == id }) else { return }
+        let a = NSAlert(); a.messageText = L("Remove “\(p.name)”?", "Удалить профиль «\(p.name)»?")
+        a.informativeText = L("Its Dock icon goes to the Trash. The data folder stays on disk, so the account and chats are not lost.",
+                              "Его значок из Дока уйдёт в Корзину. Папка с данными останется на диске: аккаунт и чаты не пропадут.")
+        a.addButton(withTitle: L("Remove", "Удалить")); a.addButton(withTitle: L("Cancel", "Отмена"))
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        if let l = p.launcher, FileManager.default.fileExists(atPath: (l as NSString).expandingTildeInPath) {
+            let app = (l as NSString).expandingTildeInPath
+            Dock.set(app, pinned: false); try? FileManager.default.trashItem(at: URL(fileURLWithPath: app), resultingItemURL: nil)
+        }
+        config.profiles.removeAll { $0.id == id }; save(); rebuild()
+    }
+}
+
 // MARK: - Helper app
 
 final class Helper: NSObject, NSApplicationDelegate {
@@ -432,6 +975,14 @@ final class Helper: NSObject, NSApplicationDelegate {
     private var ready = false
     private var timer: Timer?
     private let previewOnly = CommandLine.arguments.contains("--preview")
+    private let settingsOnly = CommandLine.arguments.contains("--settings")
+    private lazy var settings: SettingsWindow = {
+        let s = SettingsWindow()
+        s.onSave = { [weak self] in if self?.settingsOnly == false { self?.reloadConfig() } }
+        s.currentTaken = { [weak self] in self?.takenShortcuts ?? [:] }
+        s.onClose = { [weak self] in if self?.settingsOnly == true { NSApp.terminate(nil) } }
+        return s
+    }()
 
     func applicationWillFinishLaunching(_ n: Notification) {
         NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(handleURL(_:reply:)),
@@ -440,6 +991,7 @@ final class Helper: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         if previewOnly { ready = true; showPreview(); return }
+        if settingsOnly { settings.show(); return }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = critterIcon()
         item.button?.setAccessibilityLabel("Claude Profiles")
@@ -502,7 +1054,7 @@ final class Helper: NSObject, NSApplicationDelegate {
                 // A green dot marks a running profile, like the Dock's running indicator.
                 item.onStateImage = runningDot; item.offStateImage = nil
                 item.state = running[p.id] != nil ? .on : .off
-                let img = icon(for: p, c); img.size = NSSize(width: 18, height: 18); item.image = img
+                item.image = sized(icon(for: p, c), 18)
                 if let taken = takenShortcuts[p.id] {
                     item.title = p.name + "  " + L("(\(taken) is taken)", "(\(taken) занято)")
                 } else if let combo = KeyCombo.for(p, position: n), !combo.menuKey.isEmpty {
@@ -514,7 +1066,7 @@ final class Helper: NSObject, NSApplicationDelegate {
             bad.isEnabled = false
         }
         menu.addItem(.separator())
-        menu.addItem(withTitle: L("Edit Profiles…", "Настроить профили…"), action: #selector(editConfig), keyEquivalent: "").target = self
+        menu.addItem(withTitle: L("Settings…", "Настройки…"), action: #selector(openSettings), keyEquivalent: ",").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: L("Quit", "Выйти"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.delegate = self
@@ -534,14 +1086,7 @@ final class Helper: NSObject, NSApplicationDelegate {
         return image
     }()
 
-    @objc private func editConfig() {
-        // .json usually belongs to Xcode; a plain text editor is what people expect here.
-        let file = URL(fileURLWithPath: Config.path)
-        guard let editor = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.TextEdit") else {
-            NSWorkspace.shared.activateFileViewerSelecting([file]); return
-        }
-        NSWorkspace.shared.open([file], withApplicationAt: editor, configuration: NSWorkspace.OpenConfiguration())
-    }
+    @objc private func openSettings() { settings.show() }
 
     @objc func showPreview() {
         guard chooser == nil, let c = try? Config.load() else { if previewOnly { NSApp.terminate(nil) }; return }
@@ -640,29 +1185,14 @@ if let i = args.firstIndex(of: "--open"), i + 1 < args.count {
 if let i = args.firstIndex(of: "--make-launcher"), i + 2 < args.count {
     // --make-launcher <profile-id> <path/Name.app> [icon.icns]: a Dock-friendly app that runs --open.
     let id = args[i + 1], dest = (args[i + 2] as NSString).expandingTildeInPath
-    let iconSrc = i + 3 < args.count ? (args[i + 3] as NSString).expandingTildeInPath : nil
-    guard let c = try? Config.load(), let p = c.profiles.first(where: { $0.id == id }) else { print("unknown profile \(id)"); exit(1) }
-    let fm = FileManager.default
-    let contents = dest + "/Contents"
+    guard var c = try? Config.load(), let n = c.profiles.firstIndex(where: { $0.id == id }) else { print("unknown profile \(id)"); exit(1) }
+    let icon = i + 3 < args.count ? FileManager.default.contents(atPath: (args[i + 3] as NSString).expandingTildeInPath)
+                                  : launcherIconData(for: c.profiles[n], c)
     do {
-        if fm.fileExists(atPath: dest) { try fm.removeItem(atPath: dest) }
-        try fm.createDirectory(atPath: contents + "/MacOS", withIntermediateDirectories: true)
-        try fm.createDirectory(atPath: contents + "/Resources", withIntermediateDirectories: true)
-        let me = Bundle.main.executablePath ?? CommandLine.arguments[0]
-        let script = "#!/bin/sh\nexec \"\(me)\" --open '\(id.replacingOccurrences(of: "'", with: ""))'\n"
-        try script.write(toFile: contents + "/MacOS/launch", atomically: true, encoding: .utf8)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: contents + "/MacOS/launch")
-        var info: [String: Any] = [
-            "CFBundleName": (dest as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: ""),
-            "CFBundleIdentifier": helperBundleID + ".launcher." + id,
-            "CFBundleExecutable": "launch", "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": "1.0", "LSUIElement": true,
-        ]
-        if let iconSrc {
-            try fm.copyItem(atPath: iconSrc, toPath: contents + "/Resources/AppIcon.icns"); info["CFBundleIconFile"] = "AppIcon"
-        }
-        try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: URL(fileURLWithPath: contents + "/Info.plist"))
-        print("Launcher for \(p.name): \(dest)"); exit(0)
+        try makeLauncher(id: id, at: dest, icon: icon)
+        c.profiles[n].launcher = dest; try c.save()
+        if Dock.contains(dest) { Dock.reload(dest) }
+        print("Launcher for \(c.profiles[n].name): \(dest)"); exit(0)
     } catch { print(error); exit(1) }
 }
 if let i = args.firstIndex(of: "--deliver"), i + 2 < args.count {
@@ -674,7 +1204,7 @@ if let i = args.firstIndex(of: "--deliver"), i + 2 < args.count {
 
 // Only one resident helper at a time; a second launch (e.g. via a link) just exits after handing off.
 let lock = open(Config.directory + "/helper.lock", O_CREAT | O_RDWR, 0o600)
-if !args.contains("--preview") {
+if !args.contains("--preview") && !args.contains("--settings") {
     var held = false
     for _ in 0..<30 { if lock >= 0 && flock(lock, LOCK_EX | LOCK_NB) == 0 { held = true; break }; usleep(100_000) }
     if !held { exit(0) }
